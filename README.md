@@ -2,7 +2,7 @@
 
 Live air quality for any Indian city or town, plus a personalised, explained plan for your household, in English or Hindi.
 
-**Live app:** `<paste your Streamlit link here>`
+**Live app:** `<https://smog-shield-india-c8wwved3b68vtcze5ugaca.streamlit.app/>`
 
 ## What it does
 
