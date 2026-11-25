@@ -218,3 +218,20 @@ def test_quota_429_is_not_retried_for_that_model():
     with pytest.raises(L.PlanUnavailable):
         L.plan_with_fallback("p", "k", ["big", "lite"], {}, call=fake, sleep=lambda s: None)
     assert calls.count("big") == 1 and calls.count("lite") == 2
+def test_offline_plan_is_complete_and_follows_rules():
+    
+    aq = {"us_aqi": 160, "pm2_5": 70.0, "time": "2026-11-25T15:30"}
+    best = [("2026-11-25T16:00", 150)]
+
+    def plan(profile_name, lang):
+        p = L.PROFILES[profile_name]
+        imp = L.impact_summary(p, aq["pm2_5"], L.pick_swap(p["mode"], p["km"]))
+        return L.offline_plan(p, aq, imp, lang, best)
+
+    for lang in ("en", "hi"):
+        text = plan("Bengaluru senior citizen", lang)
+        assert text.count("**") == 10                      # five headings
+        assert "_" not in text                             # no field names leak
+    assert "asthma" in plan("Bengaluru senior citizen", "en").lower()
+    assert "अस्थमा" in plan("Bengaluru senior citizen", "hi")
+    assert "CO2" not in plan("Kolkata gig worker", "en")   # 60 km: no CO2 swap advice

@@ -2,8 +2,7 @@
 
 Live air quality for any Indian city or town, plus a personalised, explained plan for your household, in English or Hindi.
 
-**Live app:** `<https://smog-shield-india-c8wwved3b68vtcze5ugaca.streamlit.app/>`
-
+**Live app:** [smog-shield-india on Streamlit](https://smog-shield-india-c8wwved3b68vtcze5ugaca.streamlit.app/)
 ## What it does
 
 1. Fetches **live** air quality (US AQI, PM2.5, PM10) for the place you choose.
@@ -47,7 +46,7 @@ These are simple, approximate values. They are general guidance, not medical adv
 - Hindi plans are written fully in Hindi, including headings and units.
 - Tone changes with the AQI level (relaxed when Good, urgent when Very unhealthy or Hazardous).
 - A plan that was cut off at the model's output limit is never shown or cached.
-- **If Gemini is busy or unavailable:** the app tries a chain of models, retries, and finally shows a short rule-based tip for the current AQI level.
+- **If Gemini is busy or unavailable:** the app tries a chain of models and retries. If every model fails, it shows a full five-section plan, in English or Hindi, built from the live data and the estimates, with a reason for each tip.
 
 ## Sample inputs for evaluators
 
@@ -93,7 +92,7 @@ All logic lives in `logic.py` (no Streamlit), so it is tested without a browser 
 pytest -v
 ```
 
-**Result: 24 passed** (pytest 9.2.0, Python 3.14.10, Windows, run on 24 Nov 2026).
+**Result: 25 passed** (pytest 9.2.0, Python 3.14.10, Windows, run on 25 Nov 2026).
 
 | Area | What is checked |
 |---|---|
@@ -101,13 +100,13 @@ pytest -v
 | Estimates | Mask and purifier maths, CO₂ saving, realistic mode swap for short and long trips |
 | Prompt safety | The prompt forbids inventing numbers; contains no field names or snake_case words; shows times in plain words; uses µg/m3, not "ug/m3" |
 | Personalisation rules | Asthma priority, long-commute rules, Hindi rules (no English phrases for the model to copy), no repeated advice between sections |
-| Reliability | Falls back to the next model, retries in rounds, drops models that are out of quota or unavailable, falls back to simpler settings on a 400 error, rejects truncated plans, records which model answered and why others were skipped |
+| Reliability | Falls back to the next model, retries in rounds, drops models that are out of quota or unavailable, falls back to simpler settings on a 400 error, rejects truncated plans, records which model answered and why others were skipped | builds a full offline plan (English and Hindi) when the AI is unavailable
 
 ## Files
 
 - `app.py`: Streamlit interface (English and Hindi)
 - `logic.py`: data fetching, estimates, prompt building, model fallback
-- `test_logic.py`: the 24 tests
+- `test_logic.py`: the 25 tests
 
 ## Disclaimer
 

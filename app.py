@@ -162,13 +162,15 @@ def make_plan(prompt, models, _key):
     text = L.plan_with_fallback(prompt, _key, list(models), used)
     return text, used
 
+def show_offline():
+    st.markdown(L.offline_plan(profile, aq, imp, lang, [(h, round(v)) for h, v in best]))
 
 if st.button(t["go"], type="primary"):
     key = secret("GEMINI_API_KEY")
     if not key:
         st.info(t["nokey"])
         st.caption(f"Looked for GEMINI_API_KEY in: {SECRETS_FILE} (file exists: {SECRETS_FILE.exists()})")
-        st.write(t["tips"]["low" if aq["us_aqi"] <= 100 else "mid" if aq["us_aqi"] <= 200 else "high"])
+        show_offline()
     else:
         with st.spinner("…"):
             try:
@@ -186,7 +188,7 @@ if st.button(t["go"], type="primary"):
                 busy = all("503" in err or "429" in err for _, err in e.skipped)
                 st.warning(t["busy"] if busy else f"AI plan unavailable: {str(e)[:250]}".replace(key, "***"))
                 st.caption("Tried: " + ", ".join(f"{m} ({err})" for m, err in e.skipped))
-                st.write(t["tips"]["low" if aq["us_aqi"] <= 100 else "mid" if aq["us_aqi"] <= 200 else "high"])
+                show_offline()
             except Exception as e:
                 st.warning(f"AI plan unavailable ({type(e).__name__}).")
-                st.write(t["tips"]["low" if aq["us_aqi"] <= 100 else "mid" if aq["us_aqi"] <= 200 else "high"])
+                show_offline()
