@@ -74,7 +74,12 @@ t = T[lang]
 d = L.PROFILES["Delhi commuter"]
 for k, v in d.items():
     st.session_state.setdefault(k, v)
+# Switching language changes widget labels, which resets them on older Streamlit versions.
 
+if st.session_state.get("_lang_prev") not in (None, lang):
+    for k, v in st.session_state.get("_keep", {}).items():
+        st.session_state[k] = v
+st.session_state["_lang_prev"] = lang
 def apply_sample():
     name = st.session_state.sample
     if name in L.PROFILES:
@@ -113,7 +118,7 @@ c1.number_input(t["cadr"], 0, 1000, step=25, key="purifier_cadr")
 c1.slider(t["room"], 6, 50, key="room_m2")
 c1.slider(t["outdoor"], 0, 480, step=15, key="outdoor_min")
 profile = {k: ss[k] for k in ["city", "household", "mode", "km", "asthma", "mask", "purifier_cadr", "room_m2", "outdoor_min"]}
-
+ss["_keep"] = dict(profile)
 @st.cache_data(ttl=600, show_spinner="…")
 def get_aqi(lat, lon):
     return L.fetch_aqi(lat, lon)
