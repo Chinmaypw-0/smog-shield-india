@@ -1,5 +1,6 @@
 import pytest
 import logic as L
+from datetime import datetime, timedelta
 
 def test_categories():
     assert L.aqi_category(0)[0] == "good"
@@ -235,3 +236,17 @@ def test_offline_plan_is_complete_and_follows_rules():
     assert "asthma" in plan("Bengaluru senior citizen", "en").lower()
     assert "अस्थमा" in plan("Bengaluru senior citizen", "hi")
     assert "CO2" not in plan("Kolkata gig worker", "en")   # 60 km: no CO2 swap advice
+
+    
+
+def test_best_hours_stays_within_next_24h():
+    times = [f"2026-11-27T{h:02d}:00" for h in range(24)] + [f"2026-11-28T{h:02d}:00" for h in range(24)]
+    aqi = [300] * 24 + [20 if 6 <= h <= 10 else 250 for h in range(24)]
+    out = L.best_hours(times, aqi, "2026-11-27T00:30")
+    assert all(t.startswith("2026-11-27") for t, _ in out)
+
+
+def test_parse_response_rejects_missing_values():
+    data = {"current": {"us_aqi": None, "pm2_5": 1, "pm10": 1, "time": "t"}}
+    with pytest.raises(ValueError):
+        L.parse_response(data)

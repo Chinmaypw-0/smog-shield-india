@@ -17,6 +17,7 @@ T = {
   n95="Extra PM2.5 inhaled cut if you switch to N95", pur="Indoor PM2.5 cut from your purifier",
   pur250="…with a 250 m³/h purifier", co2="CO₂ saved per week if commuting by", nokey="No Gemini key configured — showing rule-based tips only.",
   disc="Estimates use simple documented assumptions (see README). General guidance, not medical advice.",
+  loading="Loading air quality…", generating="Generating your plan…", choose="Choose a sample profile",
   hh=dict(commuter="Daily commuter", young_children="Family with young children", seniors="Senior citizens",
           student_athlete="Student / athlete", gig_worker="Delivery / gig worker"),
   modes=dict(car="Car", two_wheeler="Two-wheeler", auto="Auto-rickshaw", bus="Bus", metro="Metro", cycle_walk="Cycle / walk"),
@@ -36,6 +37,7 @@ T = {
   n95="N95 पहनने पर साँस में जाने वाले PM2.5 में अतिरिक्त कमी", pur="आपके प्यूरिफायर से घर के अंदर PM2.5 में कमी",
   pur250="…250 m³/h प्यूरिफायर के साथ", co2="साप्ताहिक CO₂ बचत, यदि जाएँ", nokey="Gemini कुंजी नहीं मिली — केवल नियम-आधारित सुझाव।",
   disc="अनुमान सरल, दर्ज मान्यताओं पर आधारित हैं (README देखें)। यह सामान्य सलाह है, चिकित्सकीय सलाह नहीं।",
+  loading="वायु गुणवत्ता लोड हो रही है…", generating="आपकी योजना बन रही है…", choose="नमूना प्रोफ़ाइल चुनें",
   hh=dict(commuter="रोज़ आने-जाने वाले", young_children="छोटे बच्चों वाला परिवार", seniors="वरिष्ठ नागरिक",
           student_athlete="छात्र / खिलाड़ी", gig_worker="डिलीवरी / गिग वर्कर"),
   modes=dict(car="कार", two_wheeler="दोपहिया", auto="ऑटो-रिक्शा", bus="बस", metro="मेट्रो", cycle_walk="साइकिल / पैदल"),
@@ -87,7 +89,7 @@ def apply_sample():
             st.session_state[k] = v
 
 st.title(t["title"]); st.caption(t["sub"])
-st.sidebar.selectbox(t["sample"], ["—"] + list(L.PROFILES), key="sample", on_change=apply_sample)
+st.sidebar.selectbox(t["sample"], ["—"] + list(L.PROFILES), format_func=lambda x: t["choose"] if x == "—" else x, key="sample", on_change=apply_sample)
 ss = st.session_state
 c1 = st.sidebar
 ss.setdefault("places", dict(L.CITIES))
@@ -119,7 +121,7 @@ c1.slider(t["room"], 6, 50, key="room_m2")
 c1.slider(t["outdoor"], 0, 480, step=15, key="outdoor_min")
 profile = {k: ss[k] for k in ["city", "household", "mode", "km", "asthma", "mask", "purifier_cadr", "room_m2", "outdoor_min"]}
 ss["_keep"] = dict(profile)
-@st.cache_data(ttl=600, show_spinner="…")
+@st.cache_data(ttl=600, show_spinner=t["loading"])
 def get_aqi(lat, lon):
     return L.fetch_aqi(lat, lon)
 
@@ -174,10 +176,9 @@ if st.button(t["go"], type="primary"):
     key = secret("GEMINI_API_KEY")
     if not key:
         st.info(t["nokey"])
-        st.caption(f"Looked for GEMINI_API_KEY in: {SECRETS_FILE} (file exists: {SECRETS_FILE.exists()})")
         show_offline()
     else:
-        with st.spinner("…"):
+        with st.spinner(t["generating"]):
             try:
                 prompt = L.build_prompt(profile, aq, imp, lang, [(h, round(v)) for h, v in best])
                 primary = secret("GEMINI_MODEL", "gemini-3.5-flash-lite")

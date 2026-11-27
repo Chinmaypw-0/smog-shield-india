@@ -1,6 +1,7 @@
 """Pure logic (no Streamlit) so it can be unit-tested."""
 from __future__ import annotations
 import requests
+from datetime import datetime, timedelta
 
 API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -29,6 +30,7 @@ CO2_KG_PER_KM = {"car": 0.17, "two_wheeler": 0.04, "auto": 0.07,
                  "bus": 0.05, "metro": 0.03, "cycle_walk": 0.0}
 NATURAL_ACH = 0.5      # air changes/hour, windows closed
 CEILING_M = 2.7
+LONG_TRIP_KM = 40
 
 PROFILES = {
     "Delhi commuter": dict(city="Delhi", household="commuter", mode="two_wheeler",
@@ -56,6 +58,9 @@ def aqi_category(aqi: float) -> tuple[str, str]:
 
 def parse_response(data: dict) -> dict:
     cur = data["current"]
+    for key in ("us_aqi", "pm2_5", "pm10"):
+        if cur.get(key) is None:
+            raise ValueError(f"Open-Meteo returned no value for {key}")
     hourly = data.get("hourly", {})
     return {
         "us_aqi": cur["us_aqi"], "pm2_5": cur["pm2_5"], "pm10": cur["pm10"],
@@ -75,10 +80,13 @@ def fetch_aqi(lat: float, lon: float, timeout: int = 10) -> dict:
 
 
 def best_hours(times: list[str], aqi: list, now_iso: str, start=6, end=21, n=3) -> list[tuple[str, float]]:
-    """Lowest-AQI hours within the next 24h between start and end o'clock."""
+    """Lowest-AQI hours inside the next 24h, between start and end o'clock."""
+    now = datetime.fromisoformat(now_iso[:13] + ":00")
+    stop = now + timedelta(hours=24)
     rows = [(t, a) for t, a in zip(times, aqi)
-            if a is not None and t >= now_iso[:13] and start <= int(t[11:13]) <= end]
-    return sorted(rows[:24], key=lambda x: x[1])[:n]
+            if a is not None and now <= datetime.fromisoformat(t) < stop
+            and start <= int(t[11:13]) <= end]
+    return sorted(rows, key=lambda x: x[1])[:n]
 
 
 def mask_exposure(pm25: float, mask: str) -> float:
@@ -167,9 +175,6 @@ def plain_facts(p: dict, impact: dict, hi: bool = False) -> list[str]:
     return facts
 
 
-LONG_TRIP_KM = 40
-
-
 def pick_swap(mode: str, km: float) -> str:
     """A realistic mode to compare against (no metro for very long trips)."""
     if mode == "metro":
@@ -236,12 +241,6 @@ STRUCTURE
 4. Sustainable swap (a lower-emission or cleaner-air habit change; never a mask, and never advice already given in section 2)
 5. Extra care for this household
 End with one short line: general guidance, not medical advice."""
-
-
-def generate_plan(prompt: str, api_key: str, model: str = "gemini-2.5-flash") -> str:
-    from google import genai
-    client = genai.Client(api_key=api_key)
-    return client.models.generate_content(model=model, contents=prompt).text
 
 
 def parse_places(data: dict) -> list[dict]:
