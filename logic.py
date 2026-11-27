@@ -1,10 +1,25 @@
-"""Pure logic (no Streamlit) so it can be unit-tested."""
+"""Pure logic for Smog Shield India (no Streamlit), so it can be unit-tested.
+
+Covers: fetching live air quality, AQI categories, impact estimates (mask,
+purifier, CO2), the Gemini prompt, model fallback, and the offline plan.
+"""
 from __future__ import annotations
+
+import math
+import time
+
 import requests
+
+from offline_text import HH_TEXT, HI_CAT, HI_MASK, HI_MODE, OFFLINE
 
 API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 SOURCE = "Open-Meteo Air Quality API (CAMS model/satellite-derived)"
+
+def _is_finite_number(value: object) -> bool:
+    """True for a real int/float that is not NaN or infinity (booleans do not count)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
 
 CITIES = {
     "Delhi": (28.6139, 77.2090), "Mumbai": (19.0760, 72.8777),
@@ -29,6 +44,13 @@ CO2_KG_PER_KM = {"car": 0.17, "two_wheeler": 0.04, "auto": 0.07,
                  "bus": 0.05, "metro": 0.03, "cycle_walk": 0.0}
 NATURAL_ACH = 0.5      # air changes/hour, windows closed
 CEILING_M = 2.7
+LONG_TRIP_KM = 40      # beyond this, no whole-trip mode swap is suggested
+
+# Free tier: the two Lite models allow 500 requests/day, the others only 20/day,
+# so the Lite models go first.
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                   "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash")
 
 PROFILES = {
     "Delhi commuter": dict(city="Delhi", household="commuter", mode="two_wheeler",
@@ -46,7 +68,7 @@ PROFILES = {
 
 def aqi_category(aqi: float) -> tuple[str, str]:
     """Return (category_key, colour) for a US AQI value."""
-    if aqi is None or aqi < 0:
+    if not _is_finite_number(aqi) or aqi < 0:
         raise ValueError("AQI must be a non-negative number")
     for upper, key, colour in CATEGORIES:
         if aqi <= upper:
@@ -54,13 +76,54 @@ def aqi_category(aqi: float) -> tuple[str, str]:
     return CATEGORIES[-1][1], CATEGORIES[-1][2]
 
 
+def text_colour_for(background_hex: str) -> str:
+    """Pick dark or white text, whichever contrasts better with a hex background colour."""
+    h = str(background_hex).lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return "#111"
+
+    def linear(part: str) -> float:
+        c = int(part, 16) / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    lum = 0.2126 * linear(h[0:2]) + 0.7152 * linear(h[2:4]) + 0.0722 * linear(h[4:6])
+    return "#111" if (lum + 0.05) / 0.05 > 1.05 / (lum + 0.05) else "#fff"
+
+
 def parse_response(data: dict) -> dict:
-    cur = data["current"]
-    hourly = data.get("hourly", {})
+    """Check an Open-Meteo air-quality response and turn it into the flat dict the app uses.
+
+    Raises ValueError for anything missing or invalid, so a bad reading is never shown."""
+    if not isinstance(data, dict):
+        raise ValueError("Air-quality response is not an object")
+    cur = data.get("current")
+    if not isinstance(cur, dict):
+        raise ValueError("Air-quality response is missing current measurements")
+    for field in ("us_aqi", "pm2_5", "pm10"):
+        value = cur.get(field)
+        if not _is_finite_number(value) or value < 0:
+            raise ValueError(f"Air-quality response has an invalid {field} measurement")
+    if not isinstance(cur.get("time"), str) or not cur["time"].strip():
+        raise ValueError("Air-quality response is missing the measurement time")
+
+    hourly = data.get("hourly") or {}
+    if not isinstance(hourly, dict):
+        raise ValueError("Air-quality response has invalid hourly data")
+    hourly_time = hourly.get("time") or []
+    hourly_aqi = hourly.get("us_aqi") or []
+    if (not isinstance(hourly_time, list) or not isinstance(hourly_aqi, list)
+            or len(hourly_time) != len(hourly_aqi)):
+        raise ValueError("Air-quality response has mismatched hourly data")
+    if any(not isinstance(value, str) or not value.strip() for value in hourly_time):
+        raise ValueError("Air-quality response has an invalid hourly timestamp")
+    if any(value is not None and (not _is_finite_number(value) or value < 0) for value in hourly_aqi):
+        raise ValueError("Air-quality response has an invalid hourly AQI measurement")
     return {
         "us_aqi": cur["us_aqi"], "pm2_5": cur["pm2_5"], "pm10": cur["pm10"],
         "time": cur["time"], "tz": data.get("timezone_abbreviation", ""),
-        "hourly_time": hourly.get("time", []), "hourly_aqi": hourly.get("us_aqi", []),
+        "hourly_time": hourly_time, "hourly_aqi": hourly_aqi,
         "source": SOURCE,
     }
 
@@ -82,6 +145,7 @@ def best_hours(times: list[str], aqi: list, now_iso: str, start=6, end=21, n=3) 
 
 
 def mask_exposure(pm25: float, mask: str) -> float:
+    """PM2.5 that still reaches the wearer after the mask's filtering."""
     return pm25 * (1 - MASK_REDUCTION[mask])
 
 
@@ -100,6 +164,7 @@ def commute_co2_saved(km_one_way: float, from_mode: str, to_mode: str, days_per_
 
 
 def impact_summary(p: dict, pm25: float, swap_to: str = "metro") -> dict:
+    """Estimated benefits for a profile: N95 gain, purifier effect and weekly CO2 saving."""
     cur_dose = mask_exposure(pm25, p["mask"])
     n95_dose = mask_exposure(pm25, "n95")
     return {
@@ -109,6 +174,13 @@ def impact_summary(p: dict, pm25: float, swap_to: str = "metro") -> dict:
         "co2_week_kg": round(commute_co2_saved(p["km"], p["mode"], swap_to), 1),
         "swap_to": swap_to,
     }
+
+
+def pick_swap(mode: str, km: float) -> str:
+    """A realistic mode to compare against (no metro for very long trips)."""
+    if mode == "metro":
+        return "cycle_walk" if km <= 5 else "metro"
+    return "metro" if km <= LONG_TRIP_KM else "bus"
 
 
 HOUSEHOLD_HINT = {
@@ -127,7 +199,7 @@ TONE = {
     "hazardous": "Very urgent: stay indoors as much as possible, N95 if you must go out.",
 }
 
-
+# Plain-English names, so no code-style words (two_wheeler, usg...) reach the model.
 NICE = {
     "two_wheeler": "two-wheeler", "cycle_walk": "cycling/walking", "auto": "auto-rickshaw",
     "young_children": "family with young children", "seniors": "senior citizens",
@@ -137,10 +209,12 @@ NICE = {
 
 
 def nice(x: str) -> str:
+    """Plain-English name for an internal key (unknown keys come back unchanged)."""
     return NICE.get(x, x)
 
 
 def fmt_hour(iso: str, now_iso: str) -> str:
+    """Format an ISO hour as e.g. '9 PM tomorrow', relative to the current reading's date."""
     h = int(iso[11:13])
     day = "today" if iso[:10] == now_iso[:10] else "tomorrow"
     return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'} {day}"
@@ -159,33 +233,16 @@ def plain_facts(p: dict, impact: dict, hi: bool = False) -> list[str]:
     else:
         facts.append(f"They have no purifier; a 250 m3/h unit would cut roughly {impact['purifier_cut_pct_if_250']}% of indoor PM2.5 in a {p['room_m2']} m2 room (estimate).")
     if p["km"] > LONG_TRIP_KM:
-        pass
-    elif impact["co2_week_kg"] > 0:
+        return facts
+    if impact["co2_week_kg"] > 0:
         facts.append(f"Switching a {p['km']} km one-way commute from {nice(p['mode'])} to {nice(impact['swap_to'])} saves about {impact['co2_week_kg']} kg CO2 per week (estimate, {week}).")
     else:
         facts.append(f"Their commute mode ({nice(p['mode'])}) is already low-emission; do not suggest a swap for CO2 reasons.")
     return facts
 
 
-LONG_TRIP_KM = 40
-
-
-def pick_swap(mode: str, km: float) -> str:
-    """A realistic mode to compare against (no metro for very long trips)."""
-    if mode == "metro":
-        return "cycle_walk" if km <= 5 else "metro"
-    return "metro" if km <= LONG_TRIP_KM else "bus"
-
-
-def build_prompt(p: dict, aq: dict, impact: dict, lang: str, best: list) -> str:
-    cat, _ = aqi_category(aq["us_aqi"])
-    hi = lang == "hi"
-    language = "Hindi (Devanagari script)" if hi else "English"
-    why = "यह क्यों मदद करता है:" if hi else "Why it helps:"
-    week = "सप्ताह में 5 दिन मानकर" if hi else "assuming a 5-day week"
-    hours = ", ".join(f"{fmt_hour(t, aq['time'])} (AQI {a})" for t, a in best) or "not available"
-    timing_first = bool(best) and best[0][1] <= aq["us_aqi"] - 20
-    facts = "\n".join(f"- {f}" for f in plain_facts(p, impact, hi))
+def _special_rules(p: dict, hi: bool, why: str, timing_first: bool) -> str:
+    """Extra prompt instructions that apply only to some people (asthma, long commute, Hindi...)."""
     extra = []
     if p["asthma"]:
         extra.append("HEALTH PRIORITY: someone in this household has asthma or a respiratory condition. Mention asthma by name "
@@ -206,7 +263,20 @@ def build_prompt(p: dict, aq: dict, impact: dict, lang: str, best: list) -> str:
                      'Write units in Hindi: km as किमी, kg as किग्रा, minutes as मिनट, hours as घंटे; '
                      'write times the Hindi way (for example "9 PM tomorrow" as "कल रात 9 बजे"). '
                      'Only names such as N95, PM2.5, AQI and the units µg/m3 and m3/h stay in Latin letters.')
-    extra_text = "\n".join(extra)
+    return "\n".join(extra)
+
+
+def build_prompt(p: dict, aq: dict, impact: dict, lang: str, best: list) -> str:
+    """Build the Gemini prompt from live data, estimates and the person's profile."""
+    cat, _ = aqi_category(aq["us_aqi"])
+    hi = lang == "hi"
+    language = "Hindi (Devanagari script)" if hi else "English"
+    why = "यह क्यों मदद करता है:" if hi else "Why it helps:"
+    week = "सप्ताह में 5 दिन मानकर" if hi else "assuming a 5-day week"
+    hours = ", ".join(f"{fmt_hour(t, aq['time'])} (AQI {a})" for t, a in best) or "not available"
+    timing_first = bool(best) and best[0][1] <= aq["us_aqi"] - 20
+    facts = "\n".join(f"- {f}" for f in plain_facts(p, impact, hi))
+    extra_text = _special_rules(p, hi, why, timing_first)
     return f"""You are a friendly urban air-quality assistant for Indian families. Write in {language}.
 
 LIVE DATA ({aq['source']}, observed {aq['time']} local): US AQI {aq['us_aqi']} ({nice(cat)}), PM2.5 {aq['pm2_5']} µg/m3, PM10 {aq['pm10']} µg/m3.
@@ -238,23 +308,26 @@ STRUCTURE
 End with one short line: general guidance, not medical advice."""
 
 
-def generate_plan(prompt: str, api_key: str, model: str = "gemini-2.5-flash") -> str:
-    from google import genai
-    client = genai.Client(api_key=api_key)
-    return client.models.generate_content(model=model, contents=prompt).text
-
-
 def parse_places(data: dict) -> list[dict]:
     """Turn a geocoding response into [{label, lat, lon}], India only, de-duplicated."""
     out, seen = [], set()
     for r in data.get("results") or []:
-        if r.get("country_code", "IN") != "IN":
+        if not isinstance(r, dict) or r.get("country_code") != "IN":
             continue
-        label = ", ".join(x for x in (r.get("name"), r.get("admin1")) if x)
+        name = r.get("name")
+        lat, lon = r.get("latitude"), r.get("longitude")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not _is_finite_number(lat) or not -90 <= lat <= 90:
+            continue
+        if not _is_finite_number(lon) or not -180 <= lon <= 180:
+            continue
+        admin1 = r.get("admin1")
+        label = ", ".join(x.strip() for x in (name, admin1) if isinstance(x, str) and x.strip())
         if label in seen:
             continue
         seen.add(label)
-        out.append({"label": label, "lat": r["latitude"], "lon": r["longitude"]})
+        out.append({"label": label, "lat": lat, "lon": lon})
     return out
 
 
@@ -271,6 +344,7 @@ def search_places(query: str, timeout: int = 10) -> list[dict]:
 
 class PlanUnavailable(Exception):
     """Every model failed on every round. `.skipped` lists (model, error) pairs."""
+
     def __init__(self, last: Exception, skipped: list):
         super().__init__(str(last))
         self.last, self.skipped = last, skipped
@@ -283,6 +357,22 @@ class PlanText(str):
 
 class Truncated(RuntimeError):
     """The model hit its output limit mid-plan; never show or cache a cut-off plan."""
+
+
+def model_chain(primary: str = DEFAULT_MODEL) -> list[str]:
+    """Models to try in order: the chosen primary first, then the fallbacks, no repeats."""
+    return list(dict.fromkeys([primary, *FALLBACK_MODELS]))
+
+
+def describe_model_use(used: dict) -> str:
+    """One line saying which model answered, how it finished and which ones were skipped."""
+    text = f"Generated by {used.get('model')}"
+    if used.get("finish"):
+        text += f" · finish: {used['finish']}"
+    skipped = ", ".join(f"{m} ({e})" for m, e in used["skipped"])
+    if skipped:
+        text += f" · skipped: {skipped}"
+    return text
 
 
 def generate_text(prompt: str, api_key: str, model: str) -> str:
@@ -327,7 +417,6 @@ def plan_with_fallback(prompt: str, api_key: str, models: list[str], used: dict,
                        rounds: int = 2, pauses=(3, 6), call=generate_text, sleep=None) -> str:
     """Try each model in order; if all are busy (503/429) wait and go round again.
     Models that are gone (401/403/404) or out of quota (429) are dropped for the rest of the run."""
-    import time
     sleep = sleep or time.sleep
     used["skipped"] = []
     dead, last = set(), None
@@ -352,89 +441,60 @@ def plan_with_fallback(prompt: str, api_key: str, models: list[str], used: dict,
         if rnd < rounds - 1:
             sleep(pauses[min(rnd, len(pauses) - 1)])
     raise PlanUnavailable(last, list(dict.fromkeys(used["skipped"])))
-HI_CAT = {"good": "अच्छी", "moderate": "मध्यम", "usg": "संवेदनशील समूहों के लिए अस्वास्थ्यकर",
-          "unhealthy": "अस्वास्थ्यकर", "very_unhealthy": "बहुत अस्वास्थ्यकर", "hazardous": "खतरनाक"}
-HI_MODE = {"car": "कार", "two_wheeler": "दोपहिया", "auto": "ऑटो-रिक्शा", "bus": "बस",
-           "metro": "मेट्रो", "cycle_walk": "साइकिल / पैदल"}
-HI_MASK = {"none": "कोई नहीं", "cloth": "कपड़े का", "surgical": "सर्जिकल", "n95": "N95"}
 
-HH_TEXT = {
-    "en": {
-        "commuter": "Plan your commute carefully: timing, a well-fitted mask and combining trips matter most.",
-        "young_children": "Children breathe faster and are more sensitive: keep play indoors on bad days and keep the air clean where they sleep.",
-        "seniors": "Older adults are more sensitive: limit morning walks on bad days, keep medicines handy and use one clean-air room.",
-        "student_athlete": "Move hard training indoors or to the cleanest hours, and avoid intense exercise near traffic.",
-        "gig_worker": "You spend long hours outdoors: wear a well-fitted N95, take breaks in cleaner indoor spots and avoid heavy-traffic roads where you can.",
-    },
-    "hi": {
-        "commuter": "आने-जाने पर ध्यान दें: समय, साधन बदलना, मास्क की फ़िटिंग और चक्कर मिलाना।",
-        "young_children": "बच्चे तेज़ साँस लेते हैं और ज़्यादा संवेदनशील होते हैं: खराब दिनों में खेल घर के अंदर रखें और उनके सोने के कमरे में साफ़ हवा रखें।",
-        "seniors": "बुज़ुर्ग ज़्यादा संवेदनशील होते हैं: खराब दिनों में सुबह की सैर सीमित करें, दवाइयाँ/इनहेलर पास रखें और एक साफ़-हवा वाला कमरा रखें।",
-        "student_athlete": "भारी अभ्यास घर के अंदर या सबसे साफ़ घंटों में करें; AQI ज़्यादा हो तो ट्रैफ़िक के पास तेज़ कसरत से बचें।",
-        "gig_worker": "बाहर लंबे घंटे: ठीक से फिट N95, साफ़ जगहों पर ब्रेक, और संभव हो तो भारी ट्रैफ़िक से दूर के रास्ते।",
-    },
-}
 
-OFFLINE = {
-    "en": dict(
-        heads=["1. Right now", "2. Low-emission daily routine", "3. Indoor air",
-               "4. Sustainable swap", "5. Extra care for this household"],
-        why="Why it helps:",
-        now="The air is {cat} right now (PM2.5 {pm} µg/m3), so plan your day around it.",
-        now_why="Fine particles go deep into the lungs, and a higher reading means you breathe in more of them.",
-        asthma="Someone in your household has asthma: keep the inhaler and medicines within reach and stay indoors during the worst hours.",
-        asthma_why="Fine particles can trigger breathing trouble in people with asthma.",
-        hours="Do outdoor trips and exercise at the cleanest hours: {hours}.",
-        hours_why="The forecast shows lower pollution then, so you breathe in fewer particles.",
-        n95="Wear a well-fitted N95 outdoors.",
-        n95_why="Compared with your current mask ({mask}), it would cut roughly {pct}% of the fine particles you breathe in outdoors (estimate).",
-        n95_keep="You already wear an N95: keep it tight on your face and replace it when worn out.",
-        n95_keep_why="Gaps around the edges let unfiltered air in.",
-        combine="Combine errands into one trip and avoid peak traffic.",
-        combine_why="Fewer trips mean less time breathing exhaust fumes on the road.",
-        pur_have="Keep your purifier running in the room you use most, with doors and windows closed.",
-        pur_have_why="Your purifier removes roughly {pct}% of indoor PM2.5 in a {room} m2 room (estimate).",
-        pur_none="Pick one room (such as the bedroom) as a clean-air room and seal gaps around its windows and doors. A 250 m3/h purifier would help.",
-        pur_none_why="A 250 m3/h unit would cut roughly {pct}% of indoor PM2.5 in a {room} m2 room (estimate).",
-        vent="Open windows only at the cleanest outdoor hour, and use the kitchen exhaust while cooking.",
-        vent_why="Cooking smoke adds fine particles indoors, and airing out when outdoor air is cleaner lets in less pollution.",
-        swap="Try {to} instead of {frm} for your {km} km one-way commute when you can.",
-        swap_why="It saves about {kg} kg CO2 per week (estimate, assuming a 5-day week) and cuts road emissions.",
-        home="Avoid burning waste or incense indoors, and damp-mop instead of dry sweeping.",
-        home_why="Smoke and stirred-up dust add fine particles to the air you breathe at home.",
-        hh_why="Different households face different risks, so these tips target yours.",
-        closing="This plan was built from live data and simple estimates because the AI service is busy. General guidance, not medical advice.",
-    ),
-    "hi": dict(
-        heads=["1. अभी क्या करें", "2. कम प्रदूषण वाली दिनचर्या", "3. घर के अंदर की हवा",
-               "4. टिकाऊ बदलाव", "5. आपके परिवार के लिए खास ध्यान"],
-        why="यह क्यों मदद करता है:",
-        now="अभी हवा {cat} है (PM2.5 {pm} µg/m3), इसलिए अपना दिन उसी के हिसाब से बनाएँ।",
-        now_why="महीन कण फेफड़ों में गहराई तक जाते हैं, और रीडिंग जितनी ज़्यादा, उतने ज़्यादा कण साँस में जाते हैं।",
-        asthma="घर में किसी को अस्थमा है: इनहेलर और दवाइयाँ पास रखें और सबसे खराब घंटों में घर के अंदर रहें।",
-        asthma_why="महीन कण अस्थमा वाले लोगों में साँस की तकलीफ़ बढ़ा सकते हैं।",
-        hours="बाहर के काम और कसरत सबसे साफ़ घंटों में करें: {hours}।",
-        hours_why="पूर्वानुमान के अनुसार तब प्रदूषण कम रहेगा, इसलिए कम कण साँस में जाएँगे।",
-        n95="बाहर ठीक से फिट होने वाला N95 पहनें।",
-        n95_why="आपके मौजूदा मास्क ({mask}) की तुलना में इससे बाहर साँस में जाने वाले महीन कण लगभग {pct}% कम हो सकते हैं (अनुमान)।",
-        n95_keep="आप पहले से N95 पहनते हैं: उसे चेहरे पर कसकर रखें और घिस जाए तो बदल लें।",
-        n95_keep_why="किनारों के खाली हिस्सों से बिना छनी हवा अंदर आ जाती है।",
-        combine="कई छोटे काम एक ही चक्कर में निपटाएँ और भीड़ के समय से बचें।",
-        combine_why="कम चक्कर यानी सड़क पर धुएँ में कम समय।",
-        pur_have="अपना प्यूरिफायर उस कमरे में चलाएँ जहाँ आप सबसे ज़्यादा रहते हैं, दरवाज़े-खिड़कियाँ बंद रखकर।",
-        pur_have_why="आपका प्यूरिफायर {room} m2 के कमरे में घर के अंदर PM2.5 लगभग {pct}% घटाता है (अनुमान)।",
-        pur_none="एक कमरे (जैसे बेडरूम) को साफ़-हवा वाला कमरा बनाएँ और उसकी खिड़कियों-दरवाज़ों की दरारें बंद करें। 250 m3/h का प्यूरिफायर मदद करेगा।",
-        pur_none_why="250 m3/h का प्यूरिफायर {room} m2 के कमरे में घर के अंदर PM2.5 लगभग {pct}% घटा सकता है (अनुमान)।",
-        vent="खिड़कियाँ केवल बाहर की हवा के सबसे साफ़ घंटे में खोलें और खाना बनाते समय चिमनी/एग्ज़ॉस्ट चलाएँ।",
-        vent_why="खाना बनाने का धुआँ घर में महीन कण बढ़ाता है, और बाहर की हवा साफ़ होने पर हवा बदलने से कम प्रदूषण अंदर आता है।",
-        swap="{km} किमी के एक तरफ़ के सफ़र में जब हो सके {frm} की जगह {to} अपनाएँ।",
-        swap_why="इससे सप्ताह में लगभग {kg} किग्रा CO2 बचता है (अनुमान, सप्ताह में 5 दिन मानकर) और सड़क का उत्सर्जन घटता है।",
-        home="घर के अंदर कचरा या धूप-अगरबत्ती न जलाएँ और झाड़ू की जगह गीले कपड़े से पोंछा लगाएँ।",
-        home_why="धुआँ और उड़ती धूल घर की हवा में महीन कण बढ़ाते हैं।",
-        hh_why="अलग-अलग परिवारों को अलग जोखिम होते हैं, इसलिए ये सुझाव आपके परिवार के हिसाब से हैं।",
-        closing="AI सेवा व्यस्त होने के कारण यह योजना लाइव डेटा और सरल अनुमानों से बनी है। यह सामान्य सलाह है, चिकित्सकीय सलाह नहीं।",
-    ),
-}
+def _hour_label(iso: str, now_iso: str, hi: bool) -> str:
+    """A clock hour in words, e.g. '9 PM tomorrow' or 'कल 9 बजे'."""
+    if not hi:
+        return fmt_hour(iso, now_iso)
+    h = int(iso[11:13])
+    day = "आज" if iso[:10] == now_iso[:10] else "कल"
+    return f"{day} {h % 12 or 12} बजे"
+
+
+def _mode_label(mode: str, hi: bool) -> str:
+    """Commute mode name in the plan's language."""
+    return HI_MODE.get(mode, mode) if hi else nice(mode)
+
+
+def _offline_now(p: dict, aq: dict, S: dict, cat_txt: str) -> list[tuple[str, str]]:
+    """Section 1 (right now): (advice, reason) pairs."""
+    items = [(S["now"].format(cat=cat_txt, pm=aq["pm2_5"]), S["now_why"])]
+    if p["asthma"]:
+        items.append((S["asthma"], S["asthma_why"]))
+    return items
+
+
+def _offline_routine(p: dict, aq: dict, impact: dict, S: dict, best: list, hi: bool) -> list[tuple[str, str]]:
+    """Section 2 (daily routine): cleanest hours, mask advice, trip-combining."""
+    items = []
+    if best:
+        hours = ", ".join(f"{_hour_label(t, aq['time'], hi)} (AQI {round(a)})" for t, a in best)
+        items.append((S["hours"].format(hours=hours), S["hours_why"]))
+    if p["mask"] == "n95":
+        items.append((S["n95_keep"], S["n95_keep_why"]))
+    elif aq["us_aqi"] > 100:
+        mask_txt = HI_MASK[p["mask"]] if hi else p["mask"]
+        items.append((S["n95"], S["n95_why"].format(mask=mask_txt, pct=impact["n95_extra_cut_pct"])))
+    items.append((S["combine"], S["combine_why"]))
+    return items
+
+
+def _offline_indoor(p: dict, impact: dict, S: dict) -> list[tuple[str, str]]:
+    """Section 3 (indoor air): purifier advice and ventilation."""
+    if p["purifier_cadr"] > 0:
+        first = (S["pur_have"], S["pur_have_why"].format(pct=impact["purifier_cut_pct"], room=p["room_m2"]))
+    else:
+        first = (S["pur_none"], S["pur_none_why"].format(pct=impact["purifier_cut_pct_if_250"], room=p["room_m2"]))
+    return [first, (S["vent"], S["vent_why"])]
+
+
+def _offline_swap(p: dict, impact: dict, S: dict, hi: bool) -> list[tuple[str, str]]:
+    """Section 4 (sustainable swap): a mode swap for short trips, a home habit for long ones."""
+    if p["km"] <= LONG_TRIP_KM and impact["co2_week_kg"] > 0:
+        swap = S["swap"].format(to=_mode_label(impact["swap_to"], hi), frm=_mode_label(p["mode"], hi), km=p["km"])
+        return [(swap, S["swap_why"].format(kg=impact["co2_week_kg"]))]
+    return [(S["home"], S["home_why"])]
 
 
 def offline_plan(p: dict, aq: dict, impact: dict, lang: str, best: list) -> str:
@@ -443,46 +503,16 @@ def offline_plan(p: dict, aq: dict, impact: dict, lang: str, best: list) -> str:
     S = OFFLINE["hi" if hi else "en"]
     cat, _ = aqi_category(aq["us_aqi"])
     cat_txt = HI_CAT[cat] if hi else nice(cat)
-    mode_txt = (lambda m: HI_MODE.get(m, m)) if hi else nice
-    mask_txt = HI_MASK[p["mask"]] if hi else p["mask"]
 
-    def hour(t):
-        if not hi:
-            return fmt_hour(t, aq["time"])
-        h = int(t[11:13])
-        day = "आज" if t[:10] == aq["time"][:10] else "कल"
-        return f"{day} {h % 12 or 12} बजे"
-
-    def item(text, why):
-        return f"- {text}\n  - {S['why']} {why}"
-
-    sec = [[], [], [], [], []]
-    sec[0].append(item(S["now"].format(cat=cat_txt, pm=aq["pm2_5"]), S["now_why"]))
-    if p["asthma"]:
-        sec[0].append(item(S["asthma"], S["asthma_why"]))
-
-    if best:
-        hours = ", ".join(f"{hour(t)} (AQI {round(a)})" for t, a in best)
-        sec[1].append(item(S["hours"].format(hours=hours), S["hours_why"]))
-    if p["mask"] == "n95":
-        sec[1].append(item(S["n95_keep"], S["n95_keep_why"]))
-    elif aq["us_aqi"] > 100:
-        sec[1].append(item(S["n95"], S["n95_why"].format(mask=mask_txt, pct=impact["n95_extra_cut_pct"])))
-    sec[1].append(item(S["combine"], S["combine_why"]))
-
-    if p["purifier_cadr"] > 0:
-        sec[2].append(item(S["pur_have"], S["pur_have_why"].format(pct=impact["purifier_cut_pct"], room=p["room_m2"])))
-    else:
-        sec[2].append(item(S["pur_none"], S["pur_none_why"].format(pct=impact["purifier_cut_pct_if_250"], room=p["room_m2"])))
-    sec[2].append(item(S["vent"], S["vent_why"]))
-
-    if p["km"] <= LONG_TRIP_KM and impact["co2_week_kg"] > 0:
-        sec[3].append(item(S["swap"].format(to=mode_txt(impact["swap_to"]), frm=mode_txt(p["mode"]), km=p["km"]),
-                           S["swap_why"].format(kg=impact["co2_week_kg"])))
-    else:
-        sec[3].append(item(S["home"], S["home_why"]))
-
-    sec[4].append(item(HH_TEXT["hi" if hi else "en"].get(p["household"], ""), S["hh_why"]))
-
-    body = "\n\n".join(f"**{S['heads'][i]}**\n" + "\n".join(sec[i]) for i in range(5))
+    sections = [
+        _offline_now(p, aq, S, cat_txt),
+        _offline_routine(p, aq, impact, S, best, hi),
+        _offline_indoor(p, impact, S),
+        _offline_swap(p, impact, S, hi),
+        [(HH_TEXT["hi" if hi else "en"].get(p["household"], ""), S["hh_why"])],
+    ]
+    body = "\n\n".join(
+        f"**{S['heads'][i]}**\n" + "\n".join(f"- {text}\n  - {S['why']} {why}" for text, why in items)
+        for i, items in enumerate(sections)
+    )
     return f"{body}\n\n{S['closing']}"

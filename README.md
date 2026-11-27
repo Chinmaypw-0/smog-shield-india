@@ -3,6 +3,13 @@
 Live air quality for any Indian city or town, plus a personalised, explained plan for your household, in English or Hindi.
 
 **Live app:** [smog-shield-india on Streamlit](https://smog-shield-india-c8wwved3b68vtcze5ugaca.streamlit.app/)
+
+## Chosen vertical and approach
+
+**Vertical:** Environmental health, focused on severe winter smog and urban air pollution.
+
+The assistant combines a live air-quality forecast with a household's location, commute, time outdoors, respiratory needs, mask, and purifier. It uses those details to recommend lower-emission routines, cleaner times to go out, and practical indoor-air changes, while showing the assumptions behind estimated benefits. Gemini explains the plan without inventing measurements; a rule-based plan remains available when the AI service is unavailable.
+
 ## What it does
 
 1. Fetches **live** air quality (US AQI, PM2.5, PM10) for the place you choose.
@@ -21,6 +28,12 @@ Personalisation inputs: household type (daily commuter, family with young childr
 - Place search uses the Open-Meteo geocoding API (India only), so any town it knows can be searched.
 - **No number is ever invented.** If the live data cannot be fetched, the app shows an error and no figures. The AI is given the live numbers and only explains them.
 - Air-quality data is cached for 10 minutes and generated plans for 30 minutes.
+
+## Privacy and accessibility
+
+- The app has no account or name fields and does not save household profiles to a database.
+- Choosing a place sends its coordinates to Open-Meteo. Generating an AI plan sends the selected household details and live air-quality data to Google Gemini; users can use the rule-based plan without configuring an AI key.
+- The interface uses labelled Streamlit controls in English and Hindi. AQI categories are shown as text as well as color, and the status uses a screen-reader status role.
 
 ## Assumptions behind the estimates
 
@@ -86,28 +99,21 @@ Without a key the app still shows live air quality and the impact cards, with ru
 
 ## Testing
 
-All logic lives in `logic.py` (no Streamlit), so it is tested without a browser or network.
+All calculations live in `logic.py` (no Streamlit) and all interface text in `translations.py`, so the logic is tested without a browser or network. The whole app is also run headlessly with a fake network and a fake Gemini.
 
 ```bash
 pytest -v
 ```
 
-**Result: 25 passed** (pytest 9.2.0, Python 3.14.10, Windows, run on 25 Nov 2026).
+**Result: 45 passed** (pytest, Python, Windows; run `pytest -v` to verify locally).
 
 | Area | What is checked |
 |---|---|
-| Air-quality data | AQI categories, response parsing, cleanest-hours selection, India-only place search with de-duplication |
+| Air-quality data | AQI categories, rejection of invalid or non-numeric readings, response parsing, cleanest-hours selection, India-only place search with de-duplication |
 | Estimates | Mask and purifier maths, CO₂ saving, realistic mode swap for short and long trips |
 | Prompt safety | The prompt forbids inventing numbers; contains no field names or snake_case words; shows times in plain words; uses µg/m3, not "ug/m3" |
 | Personalisation rules | Asthma priority, long-commute rules, Hindi rules (no English phrases for the model to copy), no repeated advice between sections |
-| Reliability | Falls back to the next model, retries in rounds, drops models that are out of quota or unavailable, falls back to simpler settings on a 400 error, rejects truncated plans, records which model answered and why others were skipped | builds a full offline plan (English and Hindi) when the AI is unavailable
-
-## Files
-
-- `app.py`: Streamlit interface (English and Hindi)
-- `logic.py`: data fetching, estimates, prompt building, model fallback
-- `test_logic.py`: the 25 tests
-
-## Disclaimer
-
-Estimates use simple, documented assumptions. This is general guidance, not medical advice.
+| Reliability | Falls back to the next model, retries in rounds, drops models that are out of quota or unavailable, falls back to simpler settings on a 400 error, rejects truncated plans, records which model answered and why others were skipped |
+| Offline plan | A complete five-section plan, in English and Hindi, for every sample profile, with no unfilled placeholders or field names |
+| Readability | The AQI banner text colour (dark or white) is readable on every category colour |
+| Interface | The app runs in English and Hindi; numbers are shown; switching language keeps the person's choices; the plan works with and without a Gemini key; a busy or failing Gemini falls back to the rule-based plan; a failed data fetch shows an error and no numbers; the CO₂ card is hidden for very long commutes |

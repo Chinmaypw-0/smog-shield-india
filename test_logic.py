@@ -1,5 +1,8 @@
+"""Unit tests for logic.py (no network, no browser)."""
 import pytest
+
 import logic as L
+
 
 def test_categories():
     assert L.aqi_category(0)[0] == "good"
@@ -9,14 +12,23 @@ def test_categories():
     with pytest.raises(ValueError):
         L.aqi_category(-1)
 
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_categories_reject_non_finite_values(value):
+    with pytest.raises(ValueError):
+        L.aqi_category(value)
+
+
 def test_mask_and_purifier():
     assert L.mask_exposure(100, "n95") == pytest.approx(20)
     assert L.purifier_reduction(0, 15) == 0
     assert 0.5 < L.purifier_reduction(250, 15) < 1
 
+
 def test_co2():
     assert L.commute_co2_saved(10, "car", "metro") == pytest.approx(0.14 * 10 * 2 * 5)
     assert L.commute_co2_saved(10, "metro", "car") == 0
+
 
 def test_best_hours():
     times = [f"2026-11-23T{h:02d}:00" for h in range(24)]
@@ -24,10 +36,23 @@ def test_best_hours():
     out = L.best_hours(times, aqi, "2026-11-23T08:00")
     assert [o[0][11:13] for o in out] == ["21", "20", "19"]
 
+
 def test_parse():
     data = {"current": {"us_aqi": 150, "pm2_5": 60, "pm10": 90, "time": "2026-11-23T10:00"},
             "timezone_abbreviation": "GMT+5:30"}
     assert L.parse_response(data)["us_aqi"] == 150
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("us_aqi", float("nan")), ("pm2_5", -1), ("pm10", float("inf"))],
+)
+def test_parse_rejects_invalid_current_measurements(field, value):
+    data = {"current": {"us_aqi": 150, "pm2_5": 60, "pm10": 90, "time": "2026-11-23T10:00"}}
+    data["current"][field] = value
+    with pytest.raises(ValueError):
+        L.parse_response(data)
+
 
 def test_prompt_forbids_invention():
     p = L.PROFILES["Delhi commuter"]
@@ -40,14 +65,19 @@ def test_parse_places_filters_and_dedupes():
     data = {"results": [
         {"name": "Dehradun", "admin1": "Uttarakhand", "latitude": 30.3, "longitude": 78.0, "country_code": "IN"},
         {"name": "Dehradun", "admin1": "Uttarakhand", "latitude": 30.3, "longitude": 78.0, "country_code": "IN"},
-        {"name": "Dehradun", "admin1": "Elsewhere", "latitude": 1, "longitude": 2, "country_code": "US"}]}
+        {"name": "Dehradun", "admin1": "Elsewhere", "latitude": 1, "longitude": 2, "country_code": "US"},
+        {"name": "Unverified", "latitude": 1, "longitude": 2},
+        {"name": "Invalid coordinates", "latitude": float("nan"), "longitude": 2, "country_code": "IN"}]}
     out = L.parse_places(data)
     assert len(out) == 1 and out[0]["label"] == "Dehradun, Uttarakhand"
     assert L.parse_places({}) == []
 
 
 def _err(code):
-    e = RuntimeError(str(code)); e.code = code; return e
+    e = RuntimeError(str(code))
+    e.code = code
+    return e
+
 
 def test_fallback_next_model_and_retry_rounds():
     calls = []
@@ -59,6 +89,7 @@ def test_fallback_next_model_and_retry_rounds():
     used, sleeps = {}, []
     out = L.plan_with_fallback("p", "k", ["a", "b"], used, call=fake, sleep=sleeps.append)
     assert out == "plan" and used["model"] == "b" and sleeps == [3]   # one wait between rounds
+
 
 def test_dead_models_are_dropped():
     calls = []
@@ -72,16 +103,19 @@ def test_dead_models_are_dropped():
     assert calls.count("old") == 1 and calls.count("new") == 2
     assert ("old", "RuntimeError 404") in ei.value.skipped
 
+
 def test_all_dead_stops_immediately():
     def fake(prompt, key, model):
         raise _err(404)
     with pytest.raises(L.PlanUnavailable):
         L.plan_with_fallback("p", "k", ["a"], {}, call=fake, sleep=lambda s: pytest.fail("should not wait"))
 
+
 def test_pick_swap():
     assert L.pick_swap("car", 10) == "metro"
     assert L.pick_swap("car", 80) == "bus"
     assert L.pick_swap("metro", 3) == "cycle_walk"
+
 
 def test_asthma_long_trip_and_language_rules():
     p = dict(L.PROFILES["Mumbai family with toddlers"], asthma=True, km=80)
@@ -152,6 +186,7 @@ def _fake_genai(monkeypatch, behaviour):
     for n, m in (("google", google_m), ("google.genai", genai_m), ("google.genai.types", types_m)):
         monkeypatch.setitem(sys.modules, n, m)
 
+
 def test_generate_text_falls_back_on_400(monkeypatch):
     def behaviour(cfg, Resp):
         if cfg is not None and hasattr(cfg, "thinking_config"):
@@ -160,10 +195,12 @@ def test_generate_text_falls_back_on_400(monkeypatch):
     _fake_genai(monkeypatch, behaviour)
     assert L.generate_text("p", "k", "m") == "full plan"
 
+
 def test_generate_text_rejects_truncated_plan(monkeypatch):
     _fake_genai(monkeypatch, lambda cfg, Resp: Resp("half a pl", fr="FinishReason.MAX_TOKENS"))
     with pytest.raises(L.Truncated):
         L.generate_text("p", "k", "m")
+
 
 def test_unit_is_micrograms_not_ug():
     p = L.PROFILES["Delhi commuter"]
@@ -218,8 +255,9 @@ def test_quota_429_is_not_retried_for_that_model():
     with pytest.raises(L.PlanUnavailable):
         L.plan_with_fallback("p", "k", ["big", "lite"], {}, call=fake, sleep=lambda s: None)
     assert calls.count("big") == 1 and calls.count("lite") == 2
+
+
 def test_offline_plan_is_complete_and_follows_rules():
-    
     aq = {"us_aqi": 160, "pm2_5": 70.0, "time": "2026-11-25T15:30"}
     best = [("2026-11-25T16:00", 150)]
 
@@ -235,3 +273,39 @@ def test_offline_plan_is_complete_and_follows_rules():
     assert "asthma" in plan("Bengaluru senior citizen", "en").lower()
     assert "अस्थमा" in plan("Bengaluru senior citizen", "hi")
     assert "CO2" not in plan("Kolkata gig worker", "en")   # 60 km: no CO2 swap advice
+
+
+def test_text_colour_for_picks_readable_text():
+    assert L.text_colour_for("#f9a825") == "#111"    # yellow banner -> dark text
+    assert L.text_colour_for("#4e0d1c") == "#fff"    # maroon banner -> white text
+    assert L.text_colour_for("#fff") == "#111"       # short hex form
+    assert L.text_colour_for("nonsense") == "#111"   # bad input falls back to dark
+
+
+def test_every_category_banner_is_readable():
+    for _, _, colour in L.CATEGORIES:
+        text = L.text_colour_for(colour)
+        assert text in ("#111", "#fff")
+
+
+def test_model_chain_puts_primary_first_without_repeats():
+    chain = L.model_chain("my-model")
+    assert chain[0] == "my-model" and len(chain) == len(set(chain))
+    assert set(L.FALLBACK_MODELS) <= set(chain)
+    assert L.model_chain()[0] == L.DEFAULT_MODEL and len(L.model_chain()) == len(L.FALLBACK_MODELS)
+
+
+def test_describe_model_use():
+    assert L.describe_model_use({"model": "m", "finish": "STOP", "skipped": []}) == "Generated by m · finish: STOP"
+    line = L.describe_model_use({"model": "m", "finish": None, "skipped": [("a", "RuntimeError 503")]})
+    assert line == "Generated by m · skipped: a (RuntimeError 503)"
+
+
+def test_offline_plan_covers_every_profile_in_both_languages():
+    aq = {"us_aqi": 160, "pm2_5": 70.0, "time": "2026-11-25T15:30"}
+    for name, p in L.PROFILES.items():
+        imp = L.impact_summary(p, aq["pm2_5"], L.pick_swap(p["mode"], p["km"]))
+        for lang in ("en", "hi"):
+            text = L.offline_plan(p, aq, imp, lang, [])
+            assert text.count("**") == 10, (name, lang)
+            assert "{" not in text and "}" not in text, (name, lang)   # no unfilled placeholders
